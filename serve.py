@@ -36,13 +36,16 @@ import re
 import time
 import threading
 from http.server import HTTPServer, BaseHTTPRequestHandler
+from socketserver import ThreadingMixIn
 from pathlib import Path
 from urllib.parse import urlparse, parse_qs
 from urllib.request import Request, urlopen
+from concurrent.futures import ThreadPoolExecutor
 
 import openslide
 from openslide.deepzoom import DeepZoomGenerator
 from PIL import Image
+from functools import lru_cache
 
 SLIDE_DIR = Path(os.environ.get("SLIDE_DIR", "/data"))
 STAIN_DIR = Path(os.environ.get("STAIN_DIR", "/stains"))
@@ -178,6 +181,34 @@ def _get_slide(slide_id: str) -> tuple[openslide.OpenSlide, DeepZoomGenerator]:
     return osr, dz
 
 
+# ── Tile cache ──
+# Cache rendered JPEG tiles (key: (slide_id, level, col, row))
+_tile_cache: dict[tuple, bytes] = {}
+_tile_cache_lock = threading.Lock()
+TILE_CACHE_MAX = 10000  # max cached tiles (~500MB at ~50KB avg)
+
+def _get_cached_tile(slide_id: str, level: int, col: int, row: int) -> bytes:
+    key = (slide_id, level, col, row)
+    with _tile_cache_lock:
+        if key in _tile_cache:
+            return _tile_cache[key]
+
+    _, dz = _get_slide(slide_id)
+    tile = dz.get_tile(level, (col, row))
+    buf = io.BytesIO()
+    tile.save(buf, format="JPEG", quality=JPEG_QUALITY)
+    data = buf.getvalue()
+
+    with _tile_cache_lock:
+        if len(_tile_cache) >= TILE_CACHE_MAX:
+            # Evict oldest 20%
+            keys = list(_tile_cache.keys())
+            for k in keys[:len(keys) // 5]:
+                del _tile_cache[k]
+        _tile_cache[key] = data
+    return data
+
+
 class TileHandler(BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):
         pass
@@ -287,18 +318,14 @@ class TileHandler(BaseHTTPRequestHandler):
         if m:
             slide_id, level, col, row = m.group(1), int(m.group(2)), int(m.group(3)), int(m.group(4))
             try:
-                _, dz = _get_slide(slide_id)
+                data = _get_cached_tile(slide_id, level, col, row)
             except KeyError:
                 self._error(404, f"Slide not found: {slide_id}")
                 return
-            try:
-                tile = dz.get_tile(level, (col, row))
             except (ValueError, openslide.OpenSlideError) as e:
                 self._error(400, str(e))
                 return
-            buf = io.BytesIO()
-            tile.save(buf, format="JPEG", quality=JPEG_QUALITY)
-            self._send(buf.getvalue(), "image/jpeg")
+            self._send(data, "image/jpeg")
             return
 
         # Slide info: /slides/{id}/info
@@ -421,6 +448,24 @@ class TileHandler(BaseHTTPRequestHandler):
         self.end_headers()
 
 
+class ThreadedHTTPServer(ThreadingMixIn, HTTPServer):
+    """Handle each request in a new thread."""
+    daemon_threads = True
+    request_queue_size = 128
+
+
+# ── Slide pre-warming ──
+def _prewarm_stains():
+    """Pre-open all stain slides in background to eliminate cold-read latency."""
+    _rebuild_index()
+    for sid in list(_stain_index.keys()):
+        try:
+            _get_slide(sid)
+            print(f"  Pre-warmed: {sid}")
+        except Exception as e:
+            print(f"  Failed to pre-warm {sid}: {e}")
+
+
 def main():
     print(f"Tileserver starting on :{PORT}")
     print(f"  SLIDE_DIR:    {SLIDE_DIR}")
@@ -433,8 +478,13 @@ def main():
     print(f"  Source slides: {len(_slide_index)}")
     print(f"  Stain outputs: {len(_stain_index)}")
 
-    server = HTTPServer(("0.0.0.0", PORT), TileHandler)
+    # Start server immediately (Knative readiness)
+    server = ThreadedHTTPServer(("0.0.0.0", PORT), TileHandler)
     print(f"Ready: http://0.0.0.0:{PORT}")
+
+    # Pre-warm stain slides in background (source slides are too many)
+    threading.Thread(target=_prewarm_stains, daemon=True).start()
+
     server.serve_forever()
 
 
