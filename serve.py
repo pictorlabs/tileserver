@@ -339,6 +339,30 @@ class TileHandler(BaseHTTPRequestHandler):
             self._send(buf.getvalue(), "image/jpeg")
             return
 
+        # Full file download: /slides/{id}/download
+        m = re.match(r"^/slides/([^/]+)/download$", path)
+        if m:
+            slide_id = m.group(1)
+            try:
+                fpath = _resolve_slide(slide_id)
+            except KeyError:
+                self._error(404, f"Slide not found: {slide_id}")
+                return
+            file_size = fpath.stat().st_size
+            self.send_response(200)
+            self.send_header("Content-Type", "application/octet-stream")
+            self.send_header("Content-Length", str(file_size))
+            self.send_header("Content-Disposition", f'attachment; filename="{fpath.name}"')
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.end_headers()
+            with open(fpath, "rb") as f:
+                while True:
+                    chunk = f.read(1024 * 1024)  # 1MB chunks
+                    if not chunk:
+                        break
+                    self.wfile.write(chunk)
+            return
+
         # Region download: /slides/{id}/region?x=0&y=0&w=1024&h=1024&level=0
         m = re.match(r"^/slides/([^/]+)/region$", path)
         if m:
