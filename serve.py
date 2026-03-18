@@ -459,10 +459,10 @@ def _run_worker(sock: socket.socket, worker_id: int):
     server.socket = sock  # reuse shared socket
     server.server_address = sock.getsockname()
 
-    # Pre-warm stain slides in this worker
-    _prewarm_stains()
-    print(f"  Worker {worker_id} (pid {os.getpid()}) ready", flush=True)
+    # Pre-warm stain slides in background thread (don't block health checks)
+    threading.Thread(target=_prewarm_stains, daemon=True).start()
 
+    print(f"  Worker {worker_id} (pid {os.getpid()}) ready", flush=True)
     server.serve_forever()
 
 
