@@ -86,16 +86,25 @@ def _verify_jwt(token: str) -> dict | None:
     except Exception:
         return None
 
-def _check_auth(headers) -> tuple[bool, str]:
+def _check_auth(headers, query_params=None) -> tuple[bool, str]:
     if not AUTH0_DOMAIN:
         return True, ""
+    # Check Authorization header first
     auth = headers.get("Authorization", "")
-    if not auth.startswith("Bearer "):
+    if auth.startswith("Bearer "):
+        payload = _verify_jwt(auth.split(" ", 1)[1])
+        if payload is not None:
+            return True, ""
+    # Fall back to ?token= query param (for direct browser downloads)
+    if query_params:
+        token_list = query_params.get("token", [])
+        if token_list:
+            payload = _verify_jwt(token_list[0])
+            if payload is not None:
+                return True, ""
+    if not auth and not (query_params and query_params.get("token")):
         return False, "Missing or invalid Authorization header"
-    payload = _verify_jwt(auth.split(" ", 1)[1])
-    if payload is None:
-        return False, "Invalid or expired token"
-    return True, ""
+    return False, "Invalid or expired token"
 
 # ── Slide resolution ──
 SUPPORTED_EXT = {".svs", ".tiff", ".tif", ".ndpi", ".mrxs", ".scn", ".bif", ".vms"}
@@ -197,7 +206,7 @@ class TileHandler(BaseHTTPRequestHandler):
             return
 
         # Auth
-        ok, err = _check_auth(self.headers)
+        ok, err = _check_auth(self.headers, qs)
         if not ok:
             self._error(401, err)
             return
