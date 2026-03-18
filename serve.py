@@ -3,7 +3,7 @@
 Serves DeepZoom-compatible tiles for integration with OpenSeadragon.
 
 Endpoints:
-    GET /                          → health check
+    GET /                          → health check (no auth)
     GET /slides                    → list available slides
     GET /slides/{slide_id}.dzi     → DeepZoom descriptor (XML)
     GET /slides/{slide_id}/{level}/{col}_{row}.jpeg  → tile
@@ -11,19 +11,23 @@ Endpoints:
     GET /slides/{slide_id}/thumbnail?max_size=512  → thumbnail
 
 Environment:
-    SLIDE_DIR  → directory containing .svs/.tiff/.ndpi/.mrxs files (default: /data)
-    PORT       → listen port (default: 8080)
-    TILE_SIZE  → tile size in pixels (default: 254)
-    OVERLAP    → tile overlap in pixels (default: 1)
+    SLIDE_DIR    → directory containing .svs/.tiff/.ndpi/.mrxs files (default: /data)
+    SERVE_PORT   → listen port (default: 8080)
+    TILE_SIZE    → tile size in pixels (default: 254)
+    OVERLAP      → tile overlap in pixels (default: 1)
+    AUTH0_DOMAIN → Auth0 tenant domain (e.g. https://dev.us.auth0.com). If unset, auth is disabled.
+    AUTH0_AUDIENCE → expected JWT audience
 """
 
 import io
 import json
 import os
 import re
+import time
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from pathlib import Path
 from urllib.parse import urlparse, parse_qs
+from urllib.request import Request, urlopen
 from xml.etree.ElementTree import Element, SubElement, tostring
 
 import openslide
@@ -35,6 +39,66 @@ PORT = int(os.environ.get("SERVE_PORT", os.environ.get("PORT", "8080")))
 TILE_SIZE = int(os.environ.get("TILE_SIZE", "254"))
 OVERLAP = int(os.environ.get("OVERLAP", "1"))
 JPEG_QUALITY = int(os.environ.get("JPEG_QUALITY", "80"))
+
+# Auth0 config — if AUTH0_DOMAIN is unset, auth is disabled (open access)
+AUTH0_DOMAIN = os.environ.get("AUTH0_DOMAIN", "")
+AUTH0_AUDIENCE = os.environ.get("AUTH0_AUDIENCE", "")
+
+# ── Minimal JWT validation (no external deps beyond stdlib) ──
+_jwks_cache: dict | None = None
+_jwks_cache_time: float = 0
+JWKS_CACHE_TTL = 3600
+
+def _get_jwks() -> dict:
+    """Fetch JWKS from Auth0, with caching."""
+    global _jwks_cache, _jwks_cache_time
+    if _jwks_cache and time.time() - _jwks_cache_time < JWKS_CACHE_TTL:
+        return _jwks_cache
+    url = f"{AUTH0_DOMAIN.rstrip('/')}/.well-known/jwks.json"
+    with urlopen(Request(url), timeout=10) as resp:
+        _jwks_cache = json.loads(resp.read())
+        _jwks_cache_time = time.time()
+        return _jwks_cache
+
+def _b64url_decode(s: str) -> bytes:
+    """Base64url decode (no padding)."""
+    import base64
+    s += '=' * (4 - len(s) % 4)
+    return base64.urlsafe_b64decode(s)
+
+def _verify_jwt(token: str) -> dict | None:
+    """Verify an RS256 JWT against Auth0 JWKS. Returns payload or None."""
+    try:
+        import jwt as pyjwt
+        jwks = _get_jwks()
+        header = pyjwt.get_unverified_header(token)
+        for key in jwks.get("keys", []):
+            if key.get("kid") == header.get("kid"):
+                public_key = pyjwt.algorithms.RSAAlgorithm.from_jwk(json.dumps(key))
+                payload = pyjwt.decode(
+                    token,
+                    public_key,
+                    algorithms=["RS256"],
+                    audience=AUTH0_AUDIENCE,
+                    issuer=f"{AUTH0_DOMAIN.rstrip('/')}/",
+                )
+                return payload
+        return None
+    except Exception:
+        return None
+
+def _check_auth(headers) -> tuple[bool, str]:
+    """Check Authorization header. Returns (ok, error_message)."""
+    if not AUTH0_DOMAIN:
+        return True, ""  # Auth disabled
+    auth = headers.get("Authorization", "")
+    if not auth.startswith("Bearer "):
+        return False, "Missing or invalid Authorization header"
+    token = auth.split(" ", 1)[1]
+    payload = _verify_jwt(token)
+    if payload is None:
+        return False, "Invalid or expired token"
+    return True, ""
 
 # Cache: slide_id → (OpenSlide, DeepZoomGenerator)
 _cache: dict[str, tuple[openslide.OpenSlide, DeepZoomGenerator]] = {}
@@ -86,9 +150,15 @@ class TileHandler(BaseHTTPRequestHandler):
         path = parsed.path.rstrip("/")
         qs = parse_qs(parsed.query)
 
-        # Health
+        # Health — no auth (Knative readiness probe)
         if path == "" or path == "/":
             self._send(b'{"status":"ok"}', "application/json")
+            return
+
+        # Auth check on all other endpoints
+        ok, err = _check_auth(self.headers)
+        if not ok:
+            self._error(401, err)
             return
 
         # List slides
