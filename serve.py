@@ -31,7 +31,7 @@ from openslide.deepzoom import DeepZoomGenerator
 from PIL import Image
 
 SLIDE_DIR = Path(os.environ.get("SLIDE_DIR", "/data"))
-PORT = int(os.environ.get("PORT", "8080"))
+PORT = int(os.environ.get("SERVE_PORT", os.environ.get("PORT", "8080")))
 TILE_SIZE = int(os.environ.get("TILE_SIZE", "254"))
 OVERLAP = int(os.environ.get("OVERLAP", "1"))
 JPEG_QUALITY = int(os.environ.get("JPEG_QUALITY", "80"))
