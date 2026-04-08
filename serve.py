@@ -437,10 +437,55 @@ class TileHandler(BaseHTTPRequestHandler):
 
         self._error(404, "Not found")
 
+    def do_HEAD(self):
+        """Handle HEAD — same as GET but no body (needed for download preflight)."""
+        parsed = urlparse(self.path)
+        path = parsed.path.rstrip("/")
+        qs = parse_qs(parsed.query)
+
+        if path == "" or path == "/":
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", "15")
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.end_headers()
+            return
+
+        ok, err = _check_auth(self.headers, qs)
+        if not ok:
+            body = json.dumps({"error": err}).encode()
+            self.send_response(401)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.end_headers()
+            return
+
+        # Download HEAD — return file size without body
+        m = re.match(r"^/slides/([^/]+)/download$", path)
+        if m:
+            slide_id = m.group(1)
+            try:
+                fpath = _resolve_slide(slide_id)
+            except KeyError:
+                self._error(404, f"Slide not found: {slide_id}")
+                return
+            file_size = fpath.stat().st_size
+            self.send_response(200)
+            self.send_header("Content-Type", "application/octet-stream")
+            self.send_header("Content-Length", str(file_size))
+            self.send_header("Content-Disposition", f'attachment; filename="{fpath.name}"')
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.send_header("Accept-Ranges", "bytes")
+            self.end_headers()
+            return
+
+        self._error(404, "Not found")
+
     def do_OPTIONS(self):
         self.send_response(200)
         self.send_header("Access-Control-Allow-Origin", "*")
-        self.send_header("Access-Control-Allow-Methods", "GET, OPTIONS")
+        self.send_header("Access-Control-Allow-Methods", "GET, HEAD, OPTIONS")
         self.send_header("Access-Control-Allow-Headers", "Content-Type, Authorization")
         self.send_header("Connection", "keep-alive")
         self.end_headers()
